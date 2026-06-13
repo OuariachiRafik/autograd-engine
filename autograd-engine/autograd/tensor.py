@@ -218,7 +218,23 @@ class Tensor:
         assert self.data.size == 1, "backward() must start from a scalar"
         self.grad = np.ones_like(self.data)      
         for v in reversed(topo):
-            v._backward()
+            if v.grad is not None: 
+                v._backward()
 
     def zero_grad(self):
         self.grad = None
+
+def cat(tensors, axis=0):
+    tensors = [t if isinstance(t, Tensor) else Tensor(t) for t in tensors]
+    out = Tensor(np.concatenate([t.data for t in tensors], axis=axis),
+                 requires_grad=any(t.requires_grad for t in tensors),
+                 _children=tuple(tensors), _op="cat")
+    sizes = [t.shape[axis] for t in tensors]
+ 
+    def _backward():
+        pieces = np.split(out.grad, np.cumsum(sizes)[:-1], axis=axis)
+        for t, g in zip(tensors, pieces):
+            if t.requires_grad:
+                t._accum(g)
+    out._backward = _backward
+    return out
