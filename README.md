@@ -99,19 +99,63 @@ an op broadcasts (e.g. adding a `(out,)` bias to a `(batch, out)` activation),
 the upstream gradient must be summed back down the expanded axes to match the
 original shape. The gradient checks exist to catch exactly this class of bug.
 
+## Inference: KV-Cache
+
+A frozen, forward-only inference path (`inference/kv_cache.py`) that reuses the
+trained Transformer's weights to do autoregressive generation with a KV-cache.
+It runs in plain NumPy with no autograd graph, so the benchmark measures the
+inference computation, not backward-pass overhead.
+
+**Why a cache:** in autoregressive decoding the keys/values of past tokens never
+change, so recomputing them every step is wasted work. The cache stores them and
+computes K,V for only the new token each step, trading recompute for memory,
+the standard decode-phase optimization.
+
+**Verified correct (not approximate):**
+- frozen inference path matches the training-engine forward to ~1e-15
+- cached decode produces token-identical output to full recompute
+- last-token logits match to 0.0
+
+**Measured (CPU/NumPy — the ratio and scaling shape are the result, not raw tok/s;
+the no-cache baseline recomputes the full forward each step):**
+
+| gen_len | no-cache tok/s | cache tok/s | speedup |
+|--------:|---------------:|------------:|--------:|
+| 32      | 106            | 451         | 4.2×    |
+| 64      | 107            | 500         | 4.7×    |
+| 128     | 57             | 490         | 8.6×    |
+| 256     | 22             | 438         | 20.1×   |
+
+Without the cache, throughput collapses as the sequence grows (recomputing K,V
+over the whole sequence each step, ~quadratic). With the cache it stays roughly
+flat (~linear). Prefill scales with prompt length; decode is ~2 ms/token
+regardless of context, exactly what the memory-bound-decode analysis predicts.
+
 ## Layout
 
 ```
-autograd/
-  tensor.py      # Tensor, ops, _unbroadcast, cat, backward()
-  functional.py  # softmax, log_softmax, mse_loss, cross_entropy
-  nn.py          # Module, Linear, LayerNorm, RNN, LSTM, attention, Transformer
-  optim.py       # SGD, Adam
-tests/
-  test_gradcheck.py  # numerical gradient checks (the correctness proof)
-  test_train.py      # overfit-a-batch sanity check
-  test_rnn_bptt.py   # engine autodiff vs hand-written BPTT (machine-precision match)
-examples/            # MLP, RNN, LSTM, Transformer training demos
+autograd-engine/
+├── README.md                        
+├── autograd/
+│   ├── __init__.py
+│   ├── tensor.py                    (Tensor, autodiff, ops, cat)
+│   ├── functional.py                (softmax, log_softmax, mse, cross_entropy)
+│   ├── nn.py                        (Linear, LayerNorm, RNN, LSTM, MHA, Transformer…)
+│   └── optim.py                     (SGD, Adam)
+├── inference/                       
+│   ├── __init__.py                  
+│   └── kv_cache.py                  
+├── tests/
+│   ├── test_gradcheck.py
+│   ├── test_train.py
+│   ├── test_rnn_bptt.py
+│   └── test_kv_cache.py             
+└── examples/
+    ├── train_mlp.py
+    ├── train_rnn.py
+    ├── train_lstm.py
+    ├── train_transformer.py
+    └── benchmark_kv_cache.py        speedup benchmark
 ```
 
 ## Roadmap
@@ -121,6 +165,7 @@ examples/            # MLP, RNN, LSTM, Transformer training demos
 - [x] LSTM
 - [x] Transformer block (multi-head causal attention, positional encoding)
 - [ ] Mixture-of-Experts layer
+- [x] KV-cache inference path (verified, benchmarked)
 
 Each architecture is built only from the primitives above   no new autodiff
 machinery (except conv, when that lands).
